@@ -168,8 +168,8 @@ func findStreams(queryPattern string, start, end time.Time) {
 		s = e
 		timeRemaining := end.Sub(e)
 		if timeRemaining > TimeChunk {
+			log.Printf("qp=%s, end=%s, remaining=%s", queryPattern, e, timeRemaining)
 			e = e.Add(TimeChunk)
-			log.Printf("time remaining: %s", timeRemaining)
 		} else if timeRemaining <= 0 {
 			break
 		} else {
