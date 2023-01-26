@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
+	"errors"
+	"go/types"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -11,16 +16,38 @@ import (
 
 	"github.com/gogama/incite"
 
+	"github.com/abevier/tsk/ratelimiter"
+
 	"github.com/emirpasic/gods/sets/hashset"
 )
 
 const TimeChunk = 4 * time.Hour
 const TimeJitter = 5 * time.Minute
 
+const CeramicUrl = "https://ceramic-private-cpc.3boxlabs.com"
+const CeramicSyncTimeout = 60 * time.Second
+const CeramicSyncRateLimit = 10
+const CeramicSyncBurst = 5
+const CeramicSyncOutstanding = 100
+
+// Use a set to dedup the stream IDs
+var allStreamsSet = hashset.New()
+var limiter *ratelimiter.RateLimiter[string, types.Nil] = nil
+
 func main() {
 	now := time.Now()
 	start := time.Date(2022, 10, 15, 0, 0, 0, 0, time.Local)
 	end := time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, time.Local) // midnight of current day
+
+	rlOpts := ratelimiter.Opts{
+		Limit:             CeramicSyncRateLimit,
+		Burst:             CeramicSyncBurst,
+		MaxQueueDepth:     CeramicSyncOutstanding,
+		FullQueueStrategy: ratelimiter.BlockWhenFull,
+	}
+	limiter = ratelimiter.New(rlOpts, func(ctx context.Context, streamId string) (types.Nil, error) {
+		return types.Nil{}, ceramicSync(ctx, streamId)
+	})
 
 	// Query patterns
 	// [2023-01-24T15:36:15.535Z] WARNING: 'Error loading stream k2t6wyfsu4pfzxi96p62r7fdoyzk3g6syn8ur7pqe428ur9spnvg8agvbdt24b
@@ -50,11 +77,9 @@ func main() {
 		"| parse @message /of Stream (?<@streamid>\\S+)/" +
 		"| display @streamid"
 
-	// Use a set to dedup the stream IDs
-	allStreamsSet := hashset.New()
-	allStreamsSet.Add(findStreams(qp1, start, end))
-	allStreamsSet.Add(findStreams(qp2, start, end))
-	allStreamsSet.Add(findStreams(qp3, start, end))
+	findStreams(qp1, start, end)
+	findStreams(qp2, start, end)
+	findStreams(qp3, start, end)
 
 	allStreamsFile, err := os.OpenFile("./streams_all.csv", os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
@@ -96,7 +121,7 @@ func main() {
 	newStreamsWriter.Flush()
 }
 
-func findStreams(queryPattern string, start, end time.Time) *hashset.Set {
+func findStreams(queryPattern string, start, end time.Time) {
 	sess := session.Must(session.NewSession())
 	a := cloudwatchlogs.New(sess)
 	m := incite.NewQueryManager(incite.Config{Actions: a})
@@ -106,9 +131,6 @@ func findStreams(queryPattern string, start, end time.Time) *hashset.Set {
 
 	s := start
 	e := s.Add(TimeChunk)
-
-	// Use a set to dedup the stream IDs
-	streamsSet := hashset.New()
 
 	for {
 		query, err := m.Query(incite.QuerySpec{
@@ -136,7 +158,12 @@ func findStreams(queryPattern string, start, end time.Time) *hashset.Set {
 			log.Fatalf("too many results in chunk")
 		}
 		for _, record := range v {
-			streamsSet.Add(record.StreamId)
+			if !allStreamsSet.Contains(record.StreamId) {
+				allStreamsSet.Add(record.StreamId)
+				if _, err = limiter.Submit(context.Background(), record.StreamId); err != nil {
+					log.Printf("sync: failure syncing stream %s", record.StreamId)
+				}
+			}
 		}
 		s = e
 		timeRemaining := end.Sub(e)
@@ -149,5 +176,34 @@ func findStreams(queryPattern string, start, end time.Time) *hashset.Set {
 			e = e.Add(timeRemaining)
 		}
 	}
-	return streamsSet
+}
+
+func ceramicSync(ctx context.Context, streamId string) error {
+	log.Printf("sync: %s", streamId)
+
+	qCtx, qCancel := context.WithTimeout(ctx, CeramicSyncTimeout)
+	defer qCancel()
+
+	req, err := http.NewRequestWithContext(qCtx, "GET", CeramicUrl+"/api/v0/streams/"+streamId+"?sync=3", nil)
+	if err != nil {
+		log.Printf("sync: error creating stream request: %v", err)
+		return err
+	}
+	req.Header.Add("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("sync: error submitting stream request: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+	respBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("sync: error reading stream response: %v", err)
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("error in query: %v, %s", resp.StatusCode, respBody)
+		return errors.New("sync: error in response")
+	}
+	return nil
 }
