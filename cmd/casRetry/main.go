@@ -170,10 +170,10 @@ func casRequest(ctx context.Context, record Record) error {
 		log.Printf("cas: error reading response: %v", err)
 		return err
 	}
+	log.Printf("cas: resp=%s", respBody)
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("cas: error in response: %v", resp.StatusCode)
 		return errors.New("cas: error in response")
 	}
-	log.Printf("cas: resp=%+v", respBody)
 	return nil
 }
